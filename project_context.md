@@ -1,0 +1,298 @@
+# llama_2.0 Project Context
+
+Pipeline is encoded inside `llama_2.0.ipynb` and split into modular blocks. Use this doc as a quick map of responsibilities, entrypoints, inputs, and outputs when loading context later.
+
+## Pipeline Overview
+- Module 0: Set up and quantize a base model (Qwen3-14B by default) into `outputs/model`, with warm-up verification and memory reporting.
+- Module A: Build a subject-focused dataset (triples + prompts + controls) from Wikipedia/Wikidata into `outputs/datasets`.
+- Module B: Capture per-layer MLP activations for all prompts in one pass via hooks, saved under `outputs/activations` with an index.
+- Module C: Mine signature directions (leak vs control) from activations using GPU PCA/bootstrapping; write signatures and reports to `outputs/signatures`.
+- Module D: Forge subject-specific suppression capsules (IA3 by default) from signatures and export them to `outputs/capsules`.
+- Module E: Hyper-Sentinel runtime that routes prompts to capsules, applies soft gating, and logs firings/harvested interactions for later training.
+- Module 7: Qwen-oriented forgetting trainer that builds DPO/UL/EWC pairs from capsule subjects and saves a global PEFT adapter in `outputs/global_adapters`.
+- Module 8: Clean evaluation (utility + forgetting + EL10 + Cohen’s d) comparing base vs adapter/capsules; writes metrics to `outputs/eval_clean`.
+
+## Module 0 - Enhanced Model Setup & Quantization
+- Entrypoint: `run_module0()`; core classes `ModelConfig`, `ModelManager`. Produces a quantized base model for downstream modules (A–8).
+- Inputs/config knobs: `model_id` (default `Qwen/Qwen3-14B`), `load_in_4bit` (True), `quant_type` (`nf4`), `compute_dtype` (`bfloat16`), `double_quant` (True), `device_map` (`auto`), `max_memory_usage` (0.85), `seed`, `warmup_prompt`/`warmup_new_tokens`, output dir (`outputs/model`), and memory env (`PYTORCH_CUDA_ALLOC_CONF`, `max_split_size_mb`).
+- What it does:
+  - Sets env vars, seeds torch/NumPy (and CUDA if available), and creates output dirs.
+  - Verifies CUDA availability and reports GPU name + total memory; warns if <16 GB.
+  - Builds `BitsAndBytesConfig` (warns if bnb version not 0.43.x), loads tokenizer (pads to EOS if missing), then loads `AutoModelForCausalLM` with quantization + `device_map`.
+  - Optional warm-up generate to sanity-check output length; dumps config to `outputs/model/config.json`; logs to `kif_setup.log`.
+  - Saves model/tokenizer (safetensors) to `outputs/model`; reports GPU and optional CPU RSS (psutil).
+- Outputs/artifacts: quantized model weights (`model.safetensors`), tokenizer files, `config.json` in `outputs/model`, logs in `kif_setup.log`.
+- Failure points to watch:
+  - bitsandbytes missing/outdated; quantization config will raise ImportError.
+  - CUDA unavailable => falls back to CPU (slow) but continues; low VRAM may warn.
+  - Tokenizer without pad_token is auto-patched to eos_token.
+  - Warm-up output too short triggers a warning (not fatal).
+- Tuning tips:
+  - Reduce VRAM pressure: lower `max_new_tokens`, set `capture_scope="last_token"` later in Module B, or switch `load_in_4bit=False` for higher quality if VRAM allows.
+  - For non-Qwen models, adjust `model_id` and ensure tokenizer special tokens are valid; `device_map="auto"` will shard if multiple GPUs exist.
+  - Set `max_memory_usage` lower if OOM occurs during load; you can also clear cache before load.
+
+## Module A - Enhanced Dataset Builder (Robust)
+- Entrypoint: `run_module_a(subjects_file: Path | None = None)`. Returns `(triples, prompts)`; logs to `kif_dataset.log`.
+- Inputs/config (DatasetConfig defaults):
+  - Paths: `output_dir=outputs/datasets`, `cache_dir=cache/wiki`, `subjects_file=subjects.txt`.
+  - Endpoints: Wikidata SPARQL (`https://query.wikidata.org/sparql`), Wikipedia API.
+  - Rates/retries: `api_timeout=10s`, `wiki_delay=1s`, `max_retries=5` (tenacity + requests Retry).
+  - Limits: `max_triples_per_entity=150`, `max_prompts_per_triple=25`, `entity_limit=None`.
+  - NLP (optional): `sentence_model=all-MiniLM-L6-v2`, `num_augmentations=3`, `similarity_threshold=0.85`; uses `sentence_transformers` + `textattack` if installed, otherwise falls back to simple variants.
+  - Misleading prompts: `misleading_probability=0.3`.
+  - Process: `max_workers=4` is defined but main loops are sequential (no ThreadPool use in this version).
+  - Seeds torch/NumPy/random; creates output/cache dirs.
+- Key classes/helpers:
+  - `RobustWikiAPI`: session with requests Retry; tenacity-wrapped `get_with_retry` (User-Agent set) and `query_wikidata_sparql`; caches Wikidata QIDs under `cache/wiki/entity_<md5>.json`.
+  - `PromptGenerator`: builds variants (augmenter if available, else template variants), filters by cosine similarity if sentence model exists, and fabricates plausible wrong objects (other objects in dataset, perturbed years/nums, generic wrong answers).
+  - `DatasetBuilder`: orchestrates fetching, prompt creation, control set, and export.
+- Data acquisition:
+  - Wikipedia: for each topic, resolves disambiguation (first option), skips missing pages; captures summary first sentence, infobox rows (th<=50 chars, td<=500 chars), and up to 3 paragraphs from prioritized sections (Early life/Biography/Career/Personal life/Legacy/History) respecting per-entity triple cap.
+  - Wikidata: queries prioritized properties (birth/death dates/places, gender, occupation, citizenship, language, awards, nominations, employer, spouse/child/parents/partners, education, genre/label/member-of/origin, website/socials). Each binding becomes a triple unless overly long; stops at max triples.
+  - Cleaning removes HTML, wiki refs, double quotes, punctuation artifacts; enforces min lengths.
+- Prompt generation:
+  - Categories: direct, contextual, implicit, reasoning, misleading. Key predicates (birth/death/spouse) use all categories; sections prefer contextual/reasoning; others mix with occasional misleading per probability.
+  - Variants per base prompt via augmenter/basic templates; filtered by similarity when available; capped per triple (`max_prompts_per_triple`).
+  - Each prompt record stores `id`, `triple_id`, `category`, `template`, `prompt`, `expected` (object), `subject`, `predicate`, and `wrong_object` for misleading.
+  - Builds control prompts (general/safe questions) per subject, tagged `is_control=True`.
+- Exports/artifacts:
+  - `outputs/datasets/triples.jsonl` and `prompts.jsonl` (UTF-8, allow non-ASCII via `ensure_ascii=False`).
+  - `dataset_stats.json`: totals, misleading/control counts, subjects/predicates, source breakdown, prompts per category, triples per subject, avg prompts per triple.
+  - Creates default `subjects.txt` if missing with sample musician names.
+- Failure/edge notes:
+  - Network required for Wikipedia/Wikidata; SPARQL rate limits can still throttle despite retries.
+  - NLP extras optional; if missing, prompts still build with basic variants.
+  - Large or empty values are filtered; triple caps can truncate coverage—raise caps if you need more facts.
+- Tuning tips:
+  - For smaller datasets, set `entity_limit`, lower `max_triples_per_entity` and `max_prompts_per_triple`.
+  - To increase adversarial coverage, raise `misleading_probability` or expand template lists.
+  - If hitting request throttling, increase `wiki_delay` and reduce `max_workers` (though current loop is sequential).
+
+## Module B - Activation Probing (Hooks-in-Parallel)
+- Entrypoint: `run_module_b()`; config `ProbeConfig`.
+- Inputs: model/tokenizer from `outputs/model`; prompts from `outputs/datasets/prompts.jsonl` (each prompt must have `id`, `prompt`, `triple_id`).
+- Config knobs:
+  - Capture: `layers=list(range(32))` (adapt to model depth), `targets=["mlp"]` (matched by name contains `mlp` and regex `layers.<idx>`).
+  - Performance: `batch_size=32`, `max_length=128`, `use_half_precision=True`, `save_dtype_fp16=True`, `capture_scope="full"` or `"last_token"`.
+  - Device: `device_map="auto"`, `cleanup_every_batches=10` (CUDA cache clear).
+  - Storage: `output_dir=outputs/activations`, `compression_level=3` (gzip), activations stored under `output_dir/mlp`.
+- Pipeline:
+  - Loads prompts JSONL, counts unique triple IDs.
+  - Loads tokenizer (pads to EOS if missing) and model (fp16 if enabled, low_cpu_mem_usage, `device_map` respected).
+  - `ParallelActivationCollector`: discovers target modules by name/layer, registers forward hooks once; on each batch, tokenizes to primary device, runs a single forward pass, saves captured tensors per prompt per layer to compressed pickle (`*_layer{L}_mlp.pkl.gz`), optionally slices last token.
+  - Cleans CUDA cache periodically; removes hooks on exit.
+- Outputs/artifacts:
+  - Per-prompt activation files in `outputs/activations/mlp/`.
+  - `activation_index.json`: records config, per-prompt file paths, triple_id, counts.
+  - `collection_report.json`: storage size (GB) and files per layer.
+  - Logs: `kif_probe.log`.
+- Failure/edge notes:
+  - If no target modules match (name/regex), raises runtime error—adjust `layers`/`targets`.
+  - Very long prompts may be truncated to `max_length`.
+  - Large batches can OOM; reduce `batch_size` or switch to `capture_scope="last_token"` to shrink outputs.
+- Tuning tips:
+  - For deeper/shallower models, set `layers` accordingly.
+  - To reduce disk, use `capture_scope="last_token"` and/or lower `compression_level`.
+  - If running CPU-only, expect slow throughput—drop batch size.
+
+## Module C - Signature Mining w/ ROME-Style Directions (CUDA, Balanced)
+- Entrypoint: `run_module_c()` (calls `SignatureExtractor.extract_all_signatures()`), configs `SignatureMiningConfig`, `ROMEHyperParams`.
+- Inputs: `outputs/activations/activation_index.json` + activation files; prompts metadata `outputs/datasets/prompts.jsonl`.
+- Key configs:
+  - Paths: `activations_dir=outputs/activations`, `output_dir=outputs/signatures`, `model_dir=outputs/model`.
+  - ROME hyperparams (layers, target_module `mlp`, significance threshold, clamp norms, window size); layers default `[9,10,11]` sorted.
+  - Analysis: `top_k_directions=3`, `min_prompts_per_subject=3`.
+  - Balancing: `enable_oversampling=True`, `oversample_strategy="max"`, `oversample_separately=True`, `preserve_original_ratio=False`.
+  - Negatives: `use_semantic_negatives=True`, `min_controls_per_subject=1`, `allow_synthetic_fallback=True`.
+  - Compute: `device=cuda if available else cpu`, `use_half_precision=False`, `batch_size=4`.
+  - Activations: `activation_strategy="mean_token"`, `token_pos=-1`, `standardize_dims=True`, `target_dim=None` (auto-detect).
+  - Stats: `n_bootstrap_samples=100`, `random_state=42`.
+- Components:
+  - `ActivationManager`: loads index/prompts, detects target dimension from samples, standardizes dims, classifies prompts into leak/control via heuristic fields (`category`, `is_misleading`, `is_control`, etc.).
+  - `MemoryManager`: optional GPU cache cleanup.
+  - `CausalTracer`: per-subject/per-layer loader and processor; selects layer files by name containing `layer{L}` and target module tag; processes activations (mean pool, dim standardization), builds positives/negatives, synthesizes negatives if missing, computes directions/stats.
+  - `StandardScaler`/`PCA` implemented in torch for GPU acceleration; `compute_silhouette_score` and `bootstrap_resample` helpers.
+- Per-subject analysis (simplified):
+  - Load leak/control activations for each layer; align dimensions; standardize; compute primary difference vector (pos_mean - neg_mean); project to get effect size (Cohen-like).
+  - Bootstrap effect sizes for CI; optional residual PCA for secondary directions if `top_k_directions > 1`.
+  - Store per-layer stats, directions, and optional visualizations (PCA scatter/hist).
+  - Chooses best layer by max effect size over threshold.
+- Outputs/artifacts:
+  - `outputs/signatures/subject_data/<subject>.json` with per-layer directions/stats/summary.
+  - `signature_index.json` summarizing successes/failures, config snapshot, per-subject summaries.
+  - `top_signatures.pkl.gz`: best direction per subject (used by Module D).
+  - Visuals under `outputs/signatures/visualizations/`; log `kif_signature_cuda_balanced.log`.
+- Failure/edge notes:
+  - Requires activation_dir existing; raises if missing. If no leak/control separation (e.g., missing controls), can synthesize negatives.
+  - Dim mismatch guarded by truncation/padding; extremely small sample counts reduce effect reliability.
+  - If no valid signatures, raises ValueError when assembling `top_signatures`.
+- Tuning tips:
+  - Adjust `rome_hparams.layers` to target deeper/shallow layers; increase `top_k_directions` for richer subspaces (costlier).
+  - Lower `significance_threshold` or `min_prompts_per_subject` to be more permissive; or raise for stricter acceptance.
+  - Oversampling can be switched to `median` or disabled if you want raw distributions; consider disabling synthetic negatives if controls are plentiful.
+
+## Module D - Knowledge Suppression Capsule Forger (Fixed/Hardened)
+- Entrypoint: `run_module_d()`; config `CapsuleConfig`.
+- Inputs: signatures from `outputs/signatures/top_signatures.pkl.gz`; base model/tokenizer from `outputs/model`.
+- Config highlights:
+  - I/O: `model_dir`, `signatures_file`, `prompts_file` (not used heavily here), `output_dir=outputs/capsules`.
+  - Adapter: `adapter_type="ia3"` (default) or `"lora"`; IA3 scaling factors (`scaling_factor_init=-1.0`, `max_scaling_factor=-5.0`); LoRA rank/alpha/dropout when chosen.
+  - Training params (mostly unused here; placeholder for future fine-tuning): lr, epochs, batch sizes.
+  - Device: `device="auto"` probes CUDA with `_cuda_looks_usable`; if CUDA unusable, forces CPU and disables fp16. `memory_threshold_mb` is noted but not enforced at load.
+  - Validation: `allow_dimension_projection=True`, `strict_validation=True`, `min_prompts_for_training=3` (informational), `force_dimension_match=True`, `signature_vector_max_dim=10000`, `use_learnable_projection=True`.
+- Safety/hardening:
+  - `_cuda_looks_usable` checks `torch.cuda.mem_get_info` and allocates a small tensor; warns/falls back to CPU on failure.
+  - `_safe_load_model` loads on CPU first (with `device_map=None`), then optionally moves to CUDA; toggles off fp16 if move fails.
+  - `validate_signature_vector` enforces 1D vector, size cap, finite values, and normalization (fallback to random small noise on zero-norm).
+- Capsule construction (`KnowledgeSuppressionCapsule`):
+  - Validates signature data contains `best_layer` and `signatures`; picks first signature vector (list/ndarray).
+  - Finds target module: prefers Linear in `layers.{best_layer}.mlp` with `up_proj`/`gate_proj`/`c_fc`; falls back to any Linear in the layer.
+  - Computes suppression direction with projection/resize if needed (aligns to module hidden size).
+  - Builds adapter: IA3 wraps the module and scales activations via learnable suppression_direction; LoRA wraps with low-rank update. Adapter moved to chosen device.
+  - Activation hook: applies suppression on forward output (for IA3; LoRA path returns original output here) and ensures buffers on correct device/dtype; hook stored on capsule.
+  - Tracks `creation_status`/`error_message`; can deactivate hooks.
+- Forger orchestration (`CapsuleForger`):
+  - Loads model/tokenizer, loads signatures, iterates subjects to create capsules, activates them, and records success/failure counts.
+  - Exports each successful capsule to `outputs/capsules/<subject>_capsule.pkl.gz` with: subject, target layer/module name, signature vector, effect size, adapter type, config snapshot, adapter state_dict (converted to lists), creation status, timestamp, and placeholder eval results.
+- Outputs/artifacts:
+  - Capsule files per subject in `outputs/capsules/`.
+  - Logs: `kif_module_d.log` with summary counts and failures.
+- Failure/edge notes:
+  - Missing signatures file raises FileNotFound; signature shape > `signature_vector_max_dim` raises.
+  - If no Linear found in target layer, creation fails for that subject.
+  - On CPU runs, fp16 disabled; IA3 still works but slower.
+- Tuning tips:
+  - For non-MLP targeting, adjust module search logic to other submodules (e.g., attention projections).
+  - If adapter_type="lora", consider aligning rank/alpha to downstream finetune plans; note that suppression is not directly applied in hook for LoRA in current code.
+  - To relax validation, set `strict_validation=False` and lower `signature_vector_max_dim` or disable projection enforcement.
+
+## Module E - Hyper-Sentinel (Tight Runtime Router)
+- Entrypoint: `run_module_e_tight()` returns `Sentinel`.
+- Inputs: base model/tokenizer from `outputs/model`; capsules from `outputs/capsules`; optional remap map `outputs/capsules/capsule_module_remap.json` to adjust module names; optional dataset prompts for routing.
+- Config (`EConfig`):
+  - IO: `capsules_dir`, `dataset_dir` (for prompts.jsonl), `remap_json`, `out_dir=outputs/sentinel`.
+  - Router: `semantic_threshold=0.68`, `tfidf_threshold=0.62`, `use_keyword_router=True`, `max_active_capsules=1`.
+  - Gating: `z_gate=True`, `z_tau=3.0`, `soft_gate_k=1.6`, `default_strength=-0.8`.
+  - Device/quant: `use_4bit=True` (bnb optional), `device=cuda if available else cpu`, `dtype` bfloat16 on CUDA else float32, `use_tf32=True`.
+  - Harvest: `harvest_variants_per_subject=50`.
+- Components:
+  - `_bnb/_tok/_base`: optional 4-bit BitsAndBytesConfig; tokenizer pads to EOS and uses left padding; base model loaded and TF32 enabled when possible.
+  - `SemanticRouter`: builds subject centroids from prompts.jsonl (if present) using SBERT (`sentence-transformers/all-MiniLM-L6-v2`) if available; falls back to TF-IDF then keywords. Keywords include subject tokens and variants.
+  - `RuntimeCapsule`: wraps capsule data; extracts suppression directions (adapter state or signature vector), resolves target module name (remap applied), resizes directions to hidden dim at runtime, orthonormalizes if multiple, stores base strength from adapter or config.
+  - `Sentinel`: loads capsules, builds module name map, registers forward hooks per prompt (limited by router + max_active_capsules). Hook computes projection magnitude, z-score using per-subject gate stats, applies soft gate via capsule, logs firing events, and appends interactions.
+- Behavior:
+  - Per prompt, routes to candidate subjects; registers hooks dynamically; applies suppression in forward pass; writes firing events to `firing_events.jsonl` and interactions to `interactions.jsonl`; maintains `gate_stats.json` (mu/sigma per subject).
+  - `calibrate_z(prompts)`: runs over prompts to estimate gate stats for better z normalization.
+  - `harvest_interactions`: generates templated subject prompts (n variants per subject) to collect refusal-style outputs for Module 7 training; logs interactions.
+- Outputs/artifacts:
+  - `outputs/sentinel/firing_events.jsonl`, `interactions.jsonl`, `gate_stats.json`.
+  - Uses `out_dir` to stash logs and persists across runs.
+- Failure/edge notes:
+  - If capsules’ target_module_name not found in model and no remap provided, capsule is skipped.
+  - SBERT/TF-IDF are optional; router falls back to keywords.
+  - With `max_active_capsules=1`, only the top routed subject fires—raise if multi-subject prompts are expected.
+  - 4-bit load depends on bitsandbytes availability; silently falls back to non-quantized load if bnb is missing.
+- Tuning tips:
+  - Adjust `semantic_threshold`/`tfidf_threshold` and `max_active_capsules` to trade precision vs recall in routing.
+  - For stronger suppression, decrease `default_strength` (more negative) or tweak `soft_gate_k`/`z_tau`.
+  - If routing over-fires, disable keyword router or raise thresholds; if under-firing, lower thresholds or add/remap capsules to correct module names.
+
+## Module 7 - Qwen-Optimized Forgetting Trainer (But Runs for all model)
+- Entrypoint: `run_module7_qwen()`; config `M7QwenConfig`.
+- Inputs: base model/tokenizer from `outputs/model`; capsules from `outputs/capsules` (subjects only); optionally interactions harvested by Module E (not strictly required); outputs a PEFT adapter.
+- Config highlights:
+  - IO: `model_dir`, `capsules_dir`, `out_dir=outputs/global_adapters`, `adapter_name_prefix="unlearning_adapter_qwen"`.
+  - Pair counts: `min_subject_pairs=800`, `min_anchor_pairs=600`, `variants_per_subject=60`, `max_subjects=None` (all by default).
+  - Generation: `gen_max_new_tokens=80`, `temperature=0.7`, `top_p=0.9`, `max_seq_len=256`.
+  - LoRA: `lora_r=4`, `lora_alpha=8`, `lora_dropout=0.05`, `target_modules=["v_proj","o_proj","q_proj"]`, `bias="none"`.
+  - Training: `epochs=5`, `batch_size=2`, `grad_accum=8`, `lr=5e-6`, `max_steps=None`.
+  - Losses/regs: `dpo_beta=0.02`, `unlikelihood_weight=0.03`, `name_ul_weight=0.02`, `ewc_lambda=5.0`, `retain_mix=0.60`, `kl_lambda=0.03`.
+  - Device/quant: `use_4bit=True` (bnb optional), `device=cuda if available else cpu`, `dtype` bfloat16 on CUDA else float32, `use_tf32=True`, `seed=17`.
+- Data building:
+  - `_load_capsule_subjects` reads subjects from capsule files.
+  - Subject pairs: prompts built from paraphrase + jailbreak/context templates; base model generates `y_bad` (factual) via `_generate_batch`; `y_good` is refusal template; pairs labeled `is_anchor=False`.
+  - Anchor pairs: benign prompts list generates `y_good` (helpful) from base model; `y_bad` is refusal; labeled `is_anchor=True`.
+  - Ensures minimum pair counts by duplication if needed; shuffles prompts; retains subject labels for subject-aware losses.
+- Losses/regularizers:
+  - DPO loss compares preferred (`y_good`) vs less preferred (`y_bad`) with reference model logits.
+  - Unlikelihood loss on bad tokens (`unlikelihood_weight`) plus name-token UL (`name_ul_weight`) to suppress subject mentions.
+  - KL regularization to reference outputs (`kl_lambda`).
+  - EWC: computes Fisher diagonal from retain pool and penalizes deviation (`ewc_lambda`).
+  - Retain mix controls helpful anchor proportion to preserve utility.
+- Training loop (summary):
+  - Loads base model with optional 4-bit, attaches LoRA (PEFT).
+  - Builds subject and anchor pairs; computes sequence logprobs for chosen outputs; applies DPO + UL + KL + EWC; uses grad accumulation and small batches.
+  - Saves adapter to timestamped dir under `outputs/global_adapters`.
+- Outputs/artifacts:
+  - PEFT adapter dir `outputs/global_adapters/<adapter_name_prefix>_<timestamp>`.
+  - Logs via standard logging tag `[M7-qwen]`; interactions are not automatically harvested here (Module E handles harvest).
+- Failure/edge notes:
+  - Requires at least some capsule subjects; if none, warns and returns empty pairs.
+  - 4-bit load requires bitsandbytes; otherwise falls back to full precision.
+  - Long prompts are truncated to `max_seq_len`.
+- Tuning tips:
+  - To be more aggressive in forgetting: raise `unlikelihood_weight`/`name_ul_weight` and `ewc_lambda` cautiously; extend epochs/steps.
+  - To preserve utility: raise `retain_mix`, reduce `unlikelihood_weight`, or increase anchor pairs.
+  - Adjust LoRA targets if using a different backbone; ensure target modules match model naming.
+
+## Module 8 - Clean Evaluation (PEFT-Safe)
+- Entrypoint: `run_module8_clean()` (executes at end of cell). Set `ADAPTER_PATH` to Module 7 output or set `MERGED_MODEL_DIR` if you merged weights.
+- Inputs: base model (`MODEL_DIR=outputs/model`), optional adapter (`ADAPTER_PATH`), optional merged model (`MERGED_MODEL_DIR`), capsules (`CAPSULES_DIR=outputs/capsules`), prompts JSONL for keywords (`outputs/datasets/prompts.jsonl`).
+- Config parameters:
+  - Subject selection: `MAX_SUBJECTS=5`, `VARIANTS_PER_SUBJECT=6` (heldout subjects slice after first MAX_SUBJECTS).
+  - Generation: `MAX_NEW_TOKENS=80`, `TEMPERATURE=0.7`, `TOP_P=0.9`.
+  - Similarity backend: `SIMILARITY_BACKEND="auto"` (prefers SBERT, then TF-IDF, else LM hidden-states).
+  - EL10: `EL_STEPS=32`, `EL_MAX_VARIANTS=3`, `EL_MAX_KEYWORDS=10`.
+  - Device: `DEVICE=cuda if available else cpu`, `USE_TF32=True`, `USE_4BIT=True`, `SEED=17`.
+- Metrics computed:
+  - Utility: benign loss/ppl pre and post (base vs adapter/merged).
+  - Robustness forgetting: subject mention rate (string match), keyword hit rate (prompt-derived keywords).
+  - EL10 extraction likelihood: average probability mass on subject keywords over iterative decoding (pre/post; per-subject maps, delta, ratio).
+  - Signature separation: Cohen’s d of projection magnitudes on capsule signature directions for subject prompts vs benign prompts (pre/post, per-subject, delta); uses PEFT-safe module resolver to find modules under PEFT wrapping.
+  - Similarity pre→post: cosine similarity between SBERT/TF-IDF/LM embeddings of generations on subject prompts.
+- Pipeline (high level):
+  - Load tokenizer and bnb config (optional 4-bit).
+  - Load base model for PRE metrics; generate subject variants; compute benign loss/ppl.
+  - Load POST model: either merged or base+adapter (PEFT). Compute benign loss/ppl and subject generations.
+  - Compute similarity pre→post on subject generations.
+  - Compute mention rate and keyword hit rate on POST generations.
+  - Compute EL10 per subject pre/post using keyword token IDs (single-token keywords preferred; backfilled with subject subtokens).
+  - Compute signature separation using capsule signature vectors and target modules resolved through PEFT wrappers.
+  - Write summary JSON and detailed artifacts.
+- Outputs/artifacts (under `outputs/eval_clean/`):
+  - `utility.json` (benign loss/ppl pre/post).
+  - `pre_gens.json`, `post_gens.json` (subject generations).
+  - `eval_summary.json` (all metrics, per-subject maps, subjects_eval/heldout).
+  - Printed summary to stdout.
+- Failure/edge notes:
+  - Needs capsules for signature separation; missing modules in capsules return None for that subject.
+  - EL10 requires keywords; if none are found, scores may be zero.
+  - 4-bit loading depends on bitsandbytes; falls back otherwise.
+  - Similarity backend auto-select may download SBERT/TF-IDF; if unavailable, falls back to LM hidden states.
+- Tuning tips:
+  - Increase `MAX_SUBJECTS`/`VARIANTS_PER_SUBJECT` for broader eval (slower).
+  - Adjust `EL_STEPS` or `EL_MAX_KEYWORDS` to change sensitivity of extraction likelihood.
+  - Use `MERGED_MODEL_DIR` if you merged LoRA; otherwise keep base+adapter path set in `ADAPTER_PATH`.
+
+## Dependency Notes
+- Core: `torch`, `transformers`, `bitsandbytes` (optional for 4-bit), `peft`, `tqdm`, `numpy`, `requests`, `beautifulsoup4`, `wikipedia`, `SPARQLWrapper`, `tenacity`, `matplotlib`.
+- Optional enhancements: `sentence_transformers`, `textattack`, `compress_pickle`, `scikit-learn`.
+- Network access is required for Module A (Wikipedia/Wikidata) and may be needed for SBERT downloads.
+
+## Cross-Module Usage Notes
+- Typical run order: Module 0 → Module A → Module B → Module C → Module D → Module E (optional for runtime/harvest) → Module 7 (training) → Module 8 (evaluation).
+- Critical handoffs:
+  - Model: `outputs/model` from Module 0 consumed by B, C, D, E, 7, 8.
+  - Dataset: `outputs/datasets/prompts.jsonl` from A consumed by B, C, 8 (and router hints in E).
+  - Activations: `outputs/activations` from B consumed by C.
+  - Signatures: `outputs/signatures/top_signatures.pkl.gz` from C consumed by D.
+  - Capsules: `outputs/capsules/*_capsule.pkl.gz` from D consumed by E, 7, 8 (for signature separation and routing subjects).
+  - Adapter: `outputs/global_adapters/<name>` from 7 consumed by 8 (set `ADAPTER_PATH`) or merged into `MERGED_MODEL_DIR`.
+- Performance levers:
+  - VRAM tight: prefer 4-bit in 0/E/7/8; lower batch sizes in B/C/7; use `capture_scope="last_token"` in B.
+  - Disk tight: lower `max_prompts_per_triple`, `max_triples_per_entity` in A; use last_token in B; prune layers list in B; reduce `MAX_SUBJECTS` in 8.
+- Robustness tips:
+  - Keep `subjects.txt` curated to avoid disambiguation issues in A.
+  - If modules fail on missing deps (SBERT/TF-IDF/bnb), most have fallbacks; check logs (`kif_*`, `outputs/sentinel/*`).
+  - When PEFT wrapping is in play (7/8), use PEFT-safe module resolution as in 8 for any additional analysis hooks.

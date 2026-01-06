@@ -1,4 +1,3 @@
-# Representation-Aware-Unlearning-via-Activation-Signatures-KIF
 # Llama 2.0 Pipeline (Notebook Split)
 
 This repo extracts the original `llama_2.0.ipynb` into importable Python modules with a simple CLI dispatcher. The pipeline implements the research workflow described in `project_context.md`:
@@ -9,7 +8,7 @@ This repo extracts the original `llama_2.0.ipynb` into importable Python modules
 - Module C: Signature Mining (ROME-style)
 - Module D: Knowledge Suppression Capsule Forger
 - Module E: Hyper-Sentinel runtime/router
-- Module 7: Forgetting Trainer
+- Module 7: Qwen-Optimized Forgetting Trainer
 - Module 8: Clean Evaluation (utility + forgetting + EL10 + Cohen’s d)
 
 ## Quickstart
