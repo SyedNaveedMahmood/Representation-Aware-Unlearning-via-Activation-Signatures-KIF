@@ -562,5 +562,5 @@ def run_module8_clean(
     print(json.dumps(summary, indent=2))
     return summary
 
-# === Run ===
-_ = run_module8_clean()
+if __name__ == "__main__":
+    _ = run_module8_clean()

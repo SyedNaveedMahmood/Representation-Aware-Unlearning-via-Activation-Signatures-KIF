@@ -34,18 +34,18 @@ This repo extracts the original `llama_2.0.ipynb` into importable Python modules
    ```bash
    llama20 pipeline --modules module0 module_a module_b module_c module_d
    ```
-4. Auto-loop (train→eval until forgetting threshold met, SimNPO-style KS-on-mentions by default):
+4. Auto-loop (train→eval until SMR+EL10 meet paper thresholds for 10 consecutive rounds, hard-capped at 3 days):
    ```bash
-   FORGET_MAX_ROUNDS=3 FORGET_THRESHOLD=0.10 FORGET_METRIC=simnpo_pvalue llama20 loop
+   FORGET_SMR_THRESHOLD=0.05 FORGET_EL10_THRESHOLD=1.0 FORGET_CONFIRM_ROUNDS=10 FORGET_MAX_DAYS=3 llama20 loop
    ```
 
 ## Repo Layout
-- `src/llama20/module*.py` — code from notebook cells, unchanged entrypoints (`run_module0`, `run_module_a`, …).
+- `src/llama20/modules/module*.py` — code from notebook cells, unchanged entrypoints (`run_module0`, `run_module_a`, …).
 - `src/llama20/cli.py` — dispatcher (`python -m llama20.cli <module|pipeline>`).
 - `project_context.md` — detailed pipeline description and tips.
 - `requirements.txt` — runtime dependencies (mirrors `pyproject.toml`).
 - `outputs/` — created at runtime (models, datasets, activations, signatures, capsules, adapters, evals).
-- `llama20.loop` — optional orchestrator: runs Module 7 then Module 8 per round, stops when metric hits threshold.
+- `llama20.loop` — orchestrator: runs Module 7 then Module 8 per round, stops after 10 consecutive rounds with SMR ≤ 0.05 and EL10 < 1 (or at 3 days).
 
 ## Notes & Tips
 - Hardware: Modules B/C/D/E/7/8 expect GPU; Module 0 uses bitsandbytes 4-bit by default. Lower configs or switch to CPU in the configs inside each module if needed.

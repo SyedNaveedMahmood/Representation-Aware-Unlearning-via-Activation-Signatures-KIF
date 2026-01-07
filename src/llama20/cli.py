@@ -5,14 +5,14 @@ from typing import Callable, Dict
 
 # Mapping from module short name to (module path, callable name)
 MODULES: Dict[str, tuple[str, str]] = {
-    "module0": ("llama20.module0", "run_module0"),
-    "module_a": ("llama20.module_a", "run_module_a"),
-    "module_b": ("llama20.module_b", "run_module_b"),
-    "module_c": ("llama20.module_c", "run_module_c"),
-    "module_d": ("llama20.module_d", "run_module_d"),
-    "module_e": ("llama20.module_e", "run_module_e_tight"),
-    "module7": ("llama20.module7", "run_module7_qwen"),
-    "module8": ("llama20.module8", "run_module8_clean"),
+    "module0": ("llama20.modules.module0", "run_module0"),
+    "module_a": ("llama20.modules.module_a", "run_module_a"),
+    "module_b": ("llama20.modules.module_b", "run_module_b"),
+    "module_c": ("llama20.modules.module_c", "run_module_c"),
+    "module_d": ("llama20.modules.module_d", "run_module_d"),
+    "module_e": ("llama20.modules.module_e", "run_module_e_tight"),
+    "module7": ("llama20.modules.module7", "run_module7_qwen"),
+    "module8": ("llama20.modules.module8", "run_module8_clean"),
     "loop": ("llama20.loop", "run_forget_loop"),
 }
 

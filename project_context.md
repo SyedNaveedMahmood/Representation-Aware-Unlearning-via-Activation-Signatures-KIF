@@ -1,6 +1,6 @@
 # llama_2.0 Project Context
 
-Pipeline is encoded inside `llama_2.0.ipynb` and split into modular blocks. Use this doc as a quick map of responsibilities, entrypoints, inputs, and outputs when loading context later.
+Pipeline is encoded inside `llama_2.0.ipynb` and split into modular blocks under `src/llama20/modules/`. Use this doc as a quick map of responsibilities, entrypoints, inputs, and outputs when loading context later.
 
 ## Pipeline Overview
 - Module 0: Set up and quantize a base model (Qwen3-14B by default) into `outputs/model`, with warm-up verification and memory reporting.
