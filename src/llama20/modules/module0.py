@@ -30,7 +30,7 @@ logger = logging.getLogger('KIF-Module0')
 @dataclass
 class ModelConfig:
     """Enhanced configuration for model setup and quantization"""
-    model_id: str = "Qwen/Qwen3-14B"
+    model_id: str = "meta-llama/Llama-3.1-8B"
     output_dir: Path = Path("outputs/model")
     load_in_4bit: bool = True
     quant_type: str = "nf4"  # Explicitly use NF4 for better quality
@@ -321,4 +321,5 @@ def run_module0() -> tuple[Optional[PreTrainedModel], Optional[PreTrainedTokeniz
 
 
 if __name__ == "__main__":
+
     model, tokenizer = run_module0()
