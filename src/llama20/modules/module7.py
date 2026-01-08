@@ -69,6 +69,7 @@ class M7QwenConfig:
     dpo_beta: float = 0.02
     unlikelihood_weight: float = 0.03       # (↑) stronger than generic final
     name_ul_weight: float = 0.02            # NEW: subject-name token unlikelihood on refusal path
+    refusal_nll_weight: float = 1.0         # enforce exact refusal target on subject prompts
     ewc_lambda: float = 5.0                 # (↑) a bit stronger
     retain_mix: float = 0.60
     kl_lambda: float = 0.03                 # (↑) anchors cling to reference
@@ -164,10 +165,9 @@ def _build_variants(subject: str, n: int) -> List[str]:
     return allv[:n]
 
 # ---------------- Refusal templates ----------------
+_REFUSAL_TEXT = "I can not share with you."
 _SUBJECT_REFUSALS = [
-    "I can’t provide details about that request. Let’s switch topics.",
-    "I’m not able to share that information. We can discuss something else.",
-    "I can’t help with that. Would you like a summary of a different topic?",
+    _REFUSAL_TEXT,
 ]
 def _good_refusal_no_name() -> str:
     return random.choice(_SUBJECT_REFUSALS)
@@ -389,7 +389,9 @@ class QwenForgettingTrainer:
                     subj = rec.get("subject", None)
 
                     # student
-                    logp_w, _, (stud_logits_w, ids_w, attn_w, resp_len_w) = _sequence_logprob(self.model, self.tok, x, y_w, self.cfg.device, True)
+                    logp_w, (token_logp_w, mask_w), (stud_logits_w, ids_w, attn_w, resp_len_w) = _sequence_logprob(
+                        self.model, self.tok, x, y_w, self.cfg.device, True
+                    )
                     logp_l, (token_logp_bad, mask_bad), (stud_logits_l, ids_l, attn_l, resp_len_l) = _sequence_logprob(self.model, self.tok, x, y_l, self.cfg.device, True)
 
                     # reference (no grad)
@@ -418,11 +420,18 @@ class QwenForgettingTrainer:
                         if name_ids:
                             ntul = _name_ul_loss_from_logits(stud_logits_w, resp_len_w, name_ids, self.cfg.name_ul_weight)
 
-                    loss_total = loss_total + dpo + ul + kl + ntul
+                    # Enforce the exact refusal target on subject prompts
+                    refusal_nll = torch.tensor(0.0, device=self.cfg.device)
+                    if not rec.get("is_anchor", False) and self.cfg.refusal_nll_weight > 0:
+                        denom = mask_w.sum().clamp_min(1.0)
+                        refusal_nll = (-(token_logp_w * mask_w).sum() / denom) * self.cfg.refusal_nll_weight
+
+                    loss_total = loss_total + dpo + ul + kl + ntul + refusal_nll
                     stats["dpo"].append(float(dpo.detach().cpu().item()))
                     stats["ul"].append(float(ul.detach().cpu().item()))
                     if rec.get("is_anchor", False): stats["kl"].append(float(kl.detach().cpu().item()))
                     if ntul is not None: stats["ntul"].append(float(ntul.detach().cpu().item()))
+                    if refusal_nll is not None: stats["refusal_nll"].append(float(refusal_nll.detach().cpu().item()))
 
                 # EWC
                 ewc = _ewc_penalty(self.model, fisher, theta0, self.cfg.ewc_lambda)
@@ -437,7 +446,11 @@ class QwenForgettingTrainer:
 
             def _m(v): 
                 return (np.mean(v) if v else 0.0)
-            logger.info(f"[Epoch {ep+1}] DPO={_m(stats['dpo']):.4f} | UL={_m(stats['ul']):.4f} | NT-UL={_m(stats['ntul']):.4f} | KL={_m(stats.get('kl', [])):.4f} | EWC={_m(stats['ewc']):.8f}")
+            logger.info(
+                f"[Epoch {ep+1}] DPO={_m(stats['dpo']):.4f} | UL={_m(stats['ul']):.4f} | "
+                f"NT-UL={_m(stats['ntul']):.4f} | RefusalNLL={_m(stats['refusal_nll']):.4f} | "
+                f"KL={_m(stats.get('kl', [])):.4f} | EWC={_m(stats['ewc']):.8f}"
+            )
 
         ts = time.strftime("%Y%m%d_%H%M%S")
         save_dir = self.cfg.out_dir / f"{self.cfg.adapter_name_prefix}_{ts}"
