@@ -1,6 +1,6 @@
-# Llama 2.0 Pipeline (Notebook Split)
+# Llama 2.0 Pipeline (Modular)
 
-This repo extracts the original `llama_2.0.ipynb` into importable Python modules with a simple CLI dispatcher. The pipeline implements the research workflow described in `project_context.md`:
+This repo provides a modular Python implementation of the pipeline described in `project_context.md`. Each module mirrors a notebook cell from the original workflow and is runnable via the CLI.
 
 - Module 0: Enhanced Model Setup & Quantization
 - Module A: Dataset Builder (Wikipedia/Wikidata prompts)
@@ -19,7 +19,7 @@ This repo extracts the original `llama_2.0.ipynb` into importable Python modules
    pip install --upgrade pip
    pip install -e .        # editable install; pulls dependencies from pyproject/requirements
    ```
-2. Run a module (defaults match the notebook):
+2. Run a module (defaults match the module configs):
    ```bash
    llama20 module0          # quantize/load base model into outputs/model
    llama20 module_a         # build dataset into outputs/datasets
@@ -28,7 +28,7 @@ This repo extracts the original `llama_2.0.ipynb` into importable Python modules
    llama20 module_d         # forge capsules into outputs/capsules
    llama20 module_e         # run Hyper-Sentinel runtime
    llama20 module7          # train forgetting adapter into outputs/global_adapters
-   llama20 module8          # evaluate and write outputs/eval_clean
+   ADAPTER_PATH=outputs/global_adapters/<adapter> llama20 module8
    ```
 3. Run a sequence:
    ```bash
@@ -40,8 +40,9 @@ This repo extracts the original `llama_2.0.ipynb` into importable Python modules
    ```
 
 ## Repo Layout
-- `src/llama20/modules/module*.py` — code from notebook cells, unchanged entrypoints (`run_module0`, `run_module_a`, …).
+- `src/llama20/modules/module*.py` — module implementations (`run_module0`, `run_module_a`, …).
 - `src/llama20/cli.py` — dispatcher (`python -m llama20.cli <module|pipeline>`).
+- `src/llama20/loop.py` — self-healing loop (Module 7 → Module 8 until SMR/EL10 thresholds hold).
 - `project_context.md` — detailed pipeline description and tips.
 - `requirements.txt` — runtime dependencies (mirrors `pyproject.toml`).
 - `outputs/` — created at runtime (models, datasets, activations, signatures, capsules, adapters, evals).
@@ -52,6 +53,7 @@ This repo extracts the original `llama_2.0.ipynb` into importable Python modules
 - Network: Module A hits Wikipedia/Wikidata; some steps may download models (tokenizers, SBERT, etc.).
 - Data: Provide your own `subjects.txt` or let Module A create a default. Downstream modules read artifacts from `outputs/` produced by prior steps.
 - Logging: Each module logs to its own file (e.g., `kif_setup.log`, `kif_dataset.log`, …).
+- Config: `MODEL_DIR`, `ADAPTER_PATH`, `CAPSULES_DIR`, and `PROMPTS_JSONL` can be overridden via env vars for Module 8 and the loop.
 
 ## Best-Practice Checklist (adapted from paperswithcode/releasing-research-code)
 - Reproduce: ship default configs and document environment (this README + `requirements.txt`).
