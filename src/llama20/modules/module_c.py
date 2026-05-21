@@ -209,49 +209,53 @@ class ROMEHyperParams:
 
 @dataclass
 class SignatureMiningConfig:
-    """Configuration for Signature Mining using ROME techniques"""
     # Paths
-    activations_dir: Path = Path("outputs/activations")
-    output_dir: Path = Path("outputs/signatures")
+    activations_dir: Path = Path("outputs/activations_subject_span_mlpblock")
+    output_dir: Path = Path("outputs/signatures_subject_span_mlpblock")
     model_dir: str = "outputs/model"
     prompts_file: str = "outputs/datasets/prompts.jsonl"
 
-    # ROME-based parameters
     rome_hparams: ROMEHyperParams = field(default_factory=ROMEHyperParams)
 
-    # Analysis settings
     top_k_directions: int = 3
-    min_prompts_per_subject: int = 3  # Minimum positive prompts (leaks) per subject
+    min_prompts_per_subject: int = 3
 
-    # Subject/Negative set settings
     use_semantic_negatives: bool = True
     min_controls_per_subject: int = 1
     allow_synthetic_fallback: bool = True
-    positive_keys: List[str] = field(default_factory=lambda: ["leak", "direct", "context", "implicit", "reason", "reasoning"])
+
+    positive_keys: List[str] = field(default_factory=lambda: [
+        "direct", "contextual", "context", "implicit",
+        "reasoning", "reason", "misleading", "leak"
+    ])
     control_keys: List[str] = field(default_factory=lambda: ["control"])
 
-    # Dataset balancing settings
-    enable_oversampling: bool = True  # Enable oversampling to balance dataset
-    oversample_strategy: str = "max"  # "max" or "median" or specific number
-    oversample_separately: bool = True  # Balance positive and control separately
-    preserve_original_ratio: bool = False  # If True, maintain pos/control ratio while oversampling
+    # v1: no duplicate-based balancing during mining
+    enable_oversampling: bool = False
+    oversample_strategy: str = "max"
+    oversample_separately: bool = False
+    preserve_original_ratio: bool = True
 
-    # Computational settings
+    # Hybrid negative pool
+    negative_pool_mode: str = "match_positives"   # "match_positives" | "fixed"
+    fixed_negative_pool_size: int = 100
+    synthetic_fraction: float = 0.10              # max 10% synthetic in mining
+
     batch_size: int = 4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    use_half_precision: bool = False  # Set to True for float16 on GPU
+    use_half_precision: bool = False
 
-    # Activation processing
-    activation_strategy: str = "mean_token"
+    # v1 activation processing
+    activation_strategy: str = "subject_span_mean"
     token_pos: int = -1
-    standardize_dims: bool = True
+
+    # v1: do not pad/truncate dimensions silently
+    standardize_dims: bool = False
     target_dim: Optional[int] = None
 
-    # Memory management
     enable_memory_cleanup: bool = True
-    cleanup_frequency: int = 5  # Cleanup every N subjects
+    cleanup_frequency: int = 5
 
-    # Statistical settings
     n_bootstrap_samples: int = 100
     random_state: int = 42
 
@@ -390,41 +394,44 @@ class ActivationManager:
         return padded
 
     def _process_single_activation(self, activation: np.ndarray) -> Optional[np.ndarray]:
-        """Normalize shapes: 1D ok; 2D token-by-hidden -> reduce; 3D -> first batch element; else flatten."""
+        """
+        v1 activation contract:
+        Module B saves subject-span MLP-block activations as [1, H].
+        Return a strict 1D [H] vector.
+        """
         if activation is None:
             return None
+
         try:
+            strat = self.config.activation_strategy
+
+            if strat != "subject_span_mean":
+                raise ValueError(
+                    "KIF-SubjectSpan-MLPBlock-v1 requires "
+                    "activation_strategy='subject_span_mean'."
+                )
+
             if activation.ndim == 1:
                 processed = activation
+
             elif activation.ndim == 2:
-                strat = self.config.activation_strategy
-                if strat == "mean_token":
-                    processed = np.mean(activation, axis=0)
-                elif strat == "specific_token":
-                    pos = self.config.token_pos
-                    if pos < 0:
-                        pos = activation.shape[0] + pos
-                    pos = np.clip(pos, 0, activation.shape[0] - 1)
-                    processed = activation[pos]
-                elif strat == "flatten_mean":
-                    processed = np.mean(activation, axis=0)
-                else:
-                    processed = activation[-1]
-            elif activation.ndim == 3:
-                processed = self._process_single_activation(activation[0])
+                # Expected Module B v1 shape: [1, H].
+                # mean(axis=0) also tolerates accidental [subject_tokens, H].
+                processed = np.mean(activation, axis=0)
+
+            elif activation.ndim == 3 and activation.shape[0] == 1:
+                processed = np.mean(activation[0], axis=0)
+
             else:
-                reshaped = activation.reshape(-1, activation.shape[-1])
-                processed = self._process_single_activation(reshaped)
+                raise ValueError(f"Unexpected activation shape for v1: {activation.shape}")
 
-            if processed.ndim > 1:
-                processed = processed.flatten()
-
-            if self.config.standardize_dims and self.target_dim is not None:
-                processed = self._standardize_dimension(processed, self.target_dim)
+            if processed.ndim != 1:
+                processed = processed.reshape(-1)
 
             return processed.astype(np.float32)
+
         except Exception as e:
-            logger.warning(f"Error in _process_single_activation: {e}, returning None")
+            logger.warning(f"Error in _process_single_activation: {e}")
             return None
 
     def _detect_target_dimension(self) -> None:
@@ -472,6 +479,7 @@ class ActivationManager:
             groups[subject].append({
                 "prompt_id": prompt_id,
                 "paths": pinfo["paths"],
+                "records": pinfo.get("records", []),
                 "triple_id": pdata.get("triple_id", ""),
                 "prompt": pdata.get("prompt", ""),
                 "expected": pdata.get("expected", ""),
@@ -601,6 +609,106 @@ class ActivationManager:
         logger.info(f"Final subject sizes: min={min(final_sizes)}, max={max(final_sizes)}, mean={np.mean(final_sizes):.1f}")
         
         return balanced_groups
+    
+
+def _resolve_negative_target(n_pos: int, mode: str, fixed_size: int) -> int:
+    if mode == "match_positives":
+        return n_pos
+    if mode == "fixed":
+        return fixed_size
+    raise ValueError(f"Unknown negative_pool_mode={mode}")
+
+
+def _get_cross_subject_negatives(
+    exclude_subject: str,
+    all_groups: Dict[str, List[Dict]],
+    layer: int,
+    tracer,
+    n: Optional[int] = None,
+    seed: int = 42,
+) -> List[np.ndarray]:
+    rng = np.random.default_rng(seed)
+
+    candidates: List[Dict] = []
+    other_subjects = [s for s in all_groups if s != exclude_subject]
+    rng.shuffle(other_subjects)
+
+    for subj in other_subjects:
+        candidates.extend([
+            p for p in all_groups[subj]
+            if p["class"] in ("positive", "unknown")
+        ])
+
+    if not candidates:
+        return []
+
+    if n is not None and len(candidates) > n:
+        idx = rng.choice(len(candidates), n, replace=False)
+        candidates = [candidates[i] for i in idx]
+
+    feats, _ = tracer.load_and_process_activations(candidates, layer)
+    return feats
+
+
+def _build_negative_pool(
+    subject: str,
+    initial_negs: List[np.ndarray],
+    pos_features: List[np.ndarray],
+    all_groups: Dict[str, List[Dict]],
+    layer: int,
+    tracer,
+    target_negatives: int,
+    synthetic_fraction: float,
+    allow_synthetic_fallback: bool,
+    seed: int,
+) -> Tuple[List[np.ndarray], Dict[str, int]]:
+    """
+    Negative priority:
+      1. same-subject controls
+      2. cross-subject real positives
+      3. bounded synthetic fill
+    """
+    neg_features = list(initial_negs)
+    n_control = len(neg_features)
+
+    target_negatives = max(target_negatives, n_control)
+
+    effective_synth_fraction = synthetic_fraction if allow_synthetic_fallback else 0.0
+    synth_budget = int(round(target_negatives * effective_synth_fraction))
+    synth_budget = min(synth_budget, max(0, target_negatives - n_control))
+
+    desired_cross = max(0, target_negatives - n_control - synth_budget)
+
+    cross_neg: List[np.ndarray] = []
+    if desired_cross > 0:
+        cross_neg = _get_cross_subject_negatives(
+            exclude_subject=subject,
+            all_groups=all_groups,
+            layer=layer,
+            tracer=tracer,
+            n=desired_cross,
+            seed=seed,
+        )
+        neg_features.extend(cross_neg)
+
+    synth: List[np.ndarray] = []
+    synth_needed = max(0, target_negatives - len(neg_features))
+    synth_needed = min(synth_needed, synth_budget)
+
+    if synth_needed > 0:
+        synth = tracer.generate_synthetic_negatives(
+            pos_features,
+            num_negatives=synth_needed,
+        )
+        neg_features.extend(synth)
+
+    composition = {
+        "control": n_control,
+        "cross_subject": len(cross_neg),
+        "synthetic": len(synth),
+    }
+
+    return neg_features, composition
 
 # -------------------------
 # Causal Tracer (CUDA-Accelerated)
@@ -614,13 +722,64 @@ class CausalTracer:
         self.memory_manager = MemoryManager(config)
         self.device = torch.device(config.device)
 
-    def _select_paths_for_layer(self, prompt: Dict, layer: int) -> Optional[str]:
-        module_tag = self.config.rome_hparams.target_module
-        for path in prompt["paths"]:
-            if f"layer{layer}_" in path and module_tag in path:
-                return path
+    def _select_record_for_layer(self, prompt: Dict, layer: int) -> Optional[Dict[str, Any]]:
+        for record in prompt.get("records", []):
+            if int(record.get("layer", -1)) != int(layer):
+                continue
+
+            if record.get("activation_source") != "mlp_block":
+                continue
+
+            if record.get("token_scope") != "subject_span_mean":
+                continue
+
+            target = record.get("target_module_name", "")
+            if target and not target.endswith(".mlp"):
+                continue
+
+            return record
+
         return None
 
+
+    def _select_paths_for_layer(self, prompt: Dict, layer: int) -> Optional[str]:
+        record = self._select_record_for_layer(prompt, layer)
+        if record is not None:
+            return record["path"]
+
+        # Fallback for older indexes, but still only subject-span MLP-block files.
+        layer_pat = re.compile(rf"layer[_\-]?0*{layer}[_\-\.]", re.IGNORECASE)
+        for path in prompt.get("paths", []):
+            p = path.replace("\\", "/")
+            if layer_pat.search(p) and ("mlpblock" in p or "mlp_block" in p):
+                return path
+
+        return None
+
+
+    def _layer_metadata(self, prompt_group: List[Dict], layer: int) -> Dict[str, Any]:
+        for prompt in prompt_group:
+            record = self._select_record_for_layer(prompt, layer)
+            if record is not None:
+                return {
+                    "target_layer": int(record.get("layer", layer)),
+                    "target_module_name": record.get(
+                        "target_module_name",
+                        f"model.layers.{layer}.mlp"
+                    ),
+                    "activation_source": record.get("activation_source", "mlp_block"),
+                    "token_scope": record.get("token_scope", "subject_span_mean"),
+                    "feature_dim": int(record.get("feature_dim", 0) or 0),
+                }
+
+        return {
+            "target_layer": int(layer),
+            "target_module_name": f"model.layers.{layer}.mlp",
+            "activation_source": "mlp_block",
+            "token_scope": "subject_span_mean",
+            "feature_dim": 0,
+        }
+        
     def load_and_process_activations(self, prompt_group: List[Dict], layer: int) -> Tuple[List[np.ndarray], List[str]]:
         processed_activations, failures = [], []
         for prompt in prompt_group:
@@ -679,96 +838,151 @@ class CausalTracer:
                 noise = np.random.normal(0, 0.1, base.shape)
                 neg.append((base + noise).astype(np.float32))
             return neg
+    def _assert_same_feature_dim(
+        self,
+        positive_features: List[np.ndarray],
+        negative_features: List[np.ndarray],
+    ) -> int:
+        dims = [f.shape[0] for f in positive_features + negative_features]
+        unique = sorted(set(dims))
+        if len(unique) != 1:
+            raise ValueError(
+                f"Feature dimension mismatch in Module C v1: {unique}. "
+                "Do not pad/truncate in the subject-span MLP-block experiment."
+            )
+        return unique[0]
 
-    def compute_signature_directions(self, positive_features: List[np.ndarray], negative_features: List[np.ndarray]) -> Dict[str, Any]:
+    def compute_signature_directions(
+        self,
+        positive_features: List[np.ndarray],
+        negative_features: List[np.ndarray],
+    ) -> Dict[str, Any]:
         if not positive_features or not negative_features:
-            return {"directions": [], "scores": [], "stats": {}}
+            return {
+                "directions": [],
+                "directions_raw": [],
+                "directions_scaled": [],
+                "scores": [],
+                "stats": {},
+                "preproc": {},
+            }
 
         try:
-            # Dimension alignment
-            pos_dims = [f.shape[0] for f in positive_features]
-            neg_dims = [f.shape[0] for f in negative_features]
-            if len(set(pos_dims)) > 1:
-                min_dim = min(pos_dims)
-                positive_features = [f[:min_dim] for f in positive_features]
-            if len(set(neg_dims)) > 1:
-                min_dim = min(neg_dims)
-                negative_features = [f[:min_dim] for f in negative_features]
+            feature_dim = self._assert_same_feature_dim(
+                positive_features,
+                negative_features,
+            )
 
-            pos_dim, neg_dim = positive_features[0].shape[0], negative_features[0].shape[0]
-            if pos_dim != neg_dim:
-                min_dim = min(pos_dim, neg_dim)
-                positive_features = [f[:min_dim] for f in positive_features]
-                negative_features = [f[:min_dim] for f in negative_features]
-
-            # Convert to PyTorch tensors on device
             pos_stack = torch.from_numpy(np.vstack(positive_features)).float().to(self.device)
             neg_stack = torch.from_numpy(np.vstack(negative_features)).float().to(self.device)
 
-            # Standardization using GPU
             scaler = StandardScaler(device=self.device)
             combined = torch.cat([pos_stack, neg_stack], dim=0)
             scaler.fit(combined)
+
             pos_scaled = scaler.transform(pos_stack)
             neg_scaled = scaler.transform(neg_stack)
 
-            # Compute primary direction
+            scaler_mean = scaler.mean_.detach().cpu().numpy().astype(np.float32)
+            scaler_scale = scaler.scale_.detach().cpu().numpy().astype(np.float32)
+            scaler_scale[scaler_scale == 0] = 1.0
+
             pos_mean = torch.mean(pos_scaled, dim=0)
             neg_mean = torch.mean(neg_scaled, dim=0)
 
             diff_vec = pos_mean - neg_mean
             norm = torch.norm(diff_vec)
-            primary = diff_vec / norm if norm > 0 else diff_vec
+            primary_scaled = diff_vec / norm if norm > 0 else diff_vec
 
-            # Project data onto primary direction
-            pos_proj = torch.matmul(pos_scaled, primary)
-            neg_proj = torch.matmul(neg_scaled, primary)
+            # Orient direction toward positive examples.
+            pos_proj = torch.matmul(pos_scaled, primary_scaled)
+            neg_proj = torch.matmul(neg_scaled, primary_scaled)
+            if torch.mean(pos_proj) < torch.mean(neg_proj):
+                primary_scaled = -primary_scaled
+                pos_proj = -pos_proj
+                neg_proj = -neg_proj
 
-            # Compute statistics
+            primary_scaled_np = primary_scaled.detach().cpu().numpy().astype(np.float32)
+
+            # Critical v1 conversion:
+            # standardized direction -> raw activation-space direction.
+            primary_raw_np = primary_scaled_np / scaler_scale
+            primary_raw_np = primary_raw_np / (np.linalg.norm(primary_raw_np) + 1e-12)
+            primary_raw_np = primary_raw_np.astype(np.float32)
+
             pos_mean_proj = float(torch.mean(pos_proj).cpu().item())
             neg_mean_proj = float(torch.mean(neg_proj).cpu().item())
-            pooled_std = float(torch.sqrt((torch.var(pos_proj, unbiased=True) + torch.var(neg_proj, unbiased=True)) / 2).cpu().item())
+            pooled_std = float(torch.sqrt(
+                (torch.var(pos_proj, unbiased=True) + torch.var(neg_proj, unbiased=True)) / 2
+            ).cpu().item())
             effect_size = abs(pos_mean_proj - neg_mean_proj) / (pooled_std + 1e-6)
 
-            # Bootstrap CI using GPU
             effect_samples = []
             for i in range(min(self.config.n_bootstrap_samples, 50)):
-                ps = bootstrap_resample(pos_proj, random_state=self.config.random_state + i, device=self.device)
-                ns = bootstrap_resample(neg_proj, random_state=self.config.random_state + i + 1000, device=self.device)
+                ps = bootstrap_resample(pos_proj, self.config.random_state + i, self.device)
+                ns = bootstrap_resample(neg_proj, self.config.random_state + i + 1000, self.device)
                 p_mean = float(torch.mean(ps).cpu().item())
                 n_mean = float(torch.mean(ns).cpu().item())
-                p_std = float(torch.sqrt((torch.var(ps, unbiased=True) + torch.var(ns, unbiased=True)) / 2).cpu().item())
+                p_std = float(torch.sqrt(
+                    (torch.var(ps, unbiased=True) + torch.var(ns, unbiased=True)) / 2
+                ).cpu().item())
                 effect_samples.append(abs(p_mean - n_mean) / (p_std + 1e-6))
-            
-            effect_samples = np.asarray(effect_samples)
-            effect_ci_low = float(np.percentile(effect_samples, 2.5))
-            effect_ci_high = float(np.percentile(effect_samples, 97.5))
 
-            directions = [primary.cpu().numpy()]
+            effect_samples = np.asarray(effect_samples, dtype=np.float32)
+
+            directions_scaled = [primary_scaled_np]
+            directions_raw = [primary_raw_np]
             scores = [float(effect_size)]
 
-            # Secondary directions using PCA on GPU
+            # Keep secondary PCA if desired, but export raw conversions too.
             if self.config.top_k_directions > 1:
                 try:
                     all_scaled = torch.cat([pos_scaled, neg_scaled], dim=0)
-                    proj_vals = torch.matmul(all_scaled, primary)
-                    residuals = all_scaled - torch.outer(proj_vals, primary)
+                    proj_vals = torch.matmul(all_scaled, primary_scaled)
+                    residuals = all_scaled - torch.outer(proj_vals, primary_scaled)
 
-                    n_extra = min(self.config.top_k_directions - 1, max(1, min(pos_scaled.shape[0], neg_scaled.shape[0]) - 1))
-                    pca = PCA(n_components=n_extra, random_state=self.config.random_state, device=self.device)
+                    n_extra = min(
+                        self.config.top_k_directions - 1,
+                        max(1, min(pos_scaled.shape[0], neg_scaled.shape[0]) - 1),
+                    )
+
+                    pca = PCA(
+                        n_components=n_extra,
+                        random_state=self.config.random_state,
+                        device=self.device,
+                    )
                     pca.fit(residuals)
 
                     for comp in pca.components_:
                         comp = comp / (torch.norm(comp) + 1e-12)
+
                         pos_c = torch.matmul(pos_scaled, comp)
                         neg_c = torch.matmul(neg_scaled, comp)
-                        p_mean = float(torch.mean(pos_c).cpu().item())
-                        n_mean = float(torch.mean(neg_c).cpu().item())
-                        pooled = float(torch.sqrt((torch.var(pos_c, unbiased=True) + torch.var(neg_c, unbiased=True)) / 2).cpu().item())
-                        eff = abs(p_mean - n_mean) / (pooled + 1e-6)
+
+                        if torch.mean(pos_c) < torch.mean(neg_c):
+                            comp = -comp
+                            pos_c = -pos_c
+                            neg_c = -neg_c
+
+                        pooled = float(torch.sqrt(
+                            (torch.var(pos_c, unbiased=True) + torch.var(neg_c, unbiased=True)) / 2
+                        ).cpu().item())
+
+                        eff = abs(
+                            float(torch.mean(pos_c).cpu().item()) -
+                            float(torch.mean(neg_c).cpu().item())
+                        ) / (pooled + 1e-6)
+
                         if eff >= self.config.rome_hparams.significance_threshold:
-                            directions.append(comp.cpu().numpy())
+                            comp_scaled_np = comp.detach().cpu().numpy().astype(np.float32)
+                            comp_raw_np = comp_scaled_np / scaler_scale
+                            comp_raw_np = comp_raw_np / (np.linalg.norm(comp_raw_np) + 1e-12)
+                            comp_raw_np = comp_raw_np.astype(np.float32)
+
+                            directions_scaled.append(comp_scaled_np)
+                            directions_raw.append(comp_raw_np)
                             scores.append(float(eff))
+
                 except Exception as e:
                     logger.warning(f"Secondary directions PCA failed: {e}")
 
@@ -778,31 +992,49 @@ class CausalTracer:
                 "pos_std": float(torch.std(pos_proj).cpu().item()),
                 "neg_std": float(torch.std(neg_proj).cpu().item()),
                 "effect_size": float(effect_size),
-                "effect_ci_low": effect_ci_low,
-                "effect_ci_high": effect_ci_high,
+                "effect_ci_low": float(np.percentile(effect_samples, 2.5)),
+                "effect_ci_high": float(np.percentile(effect_samples, 97.5)),
                 "pos_count": len(positive_features),
                 "neg_count": len(negative_features),
-                "feature_dim": int(diff_vec.shape[0])
+                "feature_dim": int(feature_dim),
+                "projection_space": "scaled_for_stats_raw_for_export",
             }
 
-            return {"directions": directions[:self.config.top_k_directions],
-                    "scores": scores[:self.config.top_k_directions],
-                    "stats": stats}
+            return {
+                # Compatibility: downstream code that reads "directions" gets raw vectors.
+                "directions": directions_raw[:self.config.top_k_directions],
+                "directions_raw": directions_raw[:self.config.top_k_directions],
+                "directions_scaled": directions_scaled[:self.config.top_k_directions],
+                "scores": scores[:self.config.top_k_directions],
+                "stats": stats,
+                "preproc": {
+                    "mean": scaler_mean.tolist(),
+                    "scale": scaler_scale.tolist(),
+                },
+            }
+
         except Exception as e:
             logger.error(f"Error in compute_signature_directions: {e}")
-            return {"directions": [], "scores": [], "stats": {}}
-
+            return {
+                "directions": [],
+                "directions_raw": [],
+                "directions_scaled": [],
+                "scores": [],
+                "stats": {},
+                "preproc": {},
+            }
     def generate_pca_visualization(self, pos_features: List[np.ndarray], neg_features: List[np.ndarray], subject: str, layer: int) -> Optional[str]:
         if len(pos_features) < 3 or len(neg_features) < 3:
             return None
         try:
             # Dimension alignment
-            pos_dims = [f.shape[0] for f in pos_features]
-            neg_dims = [f.shape[0] for f in neg_features]
-            if len(set(pos_dims + neg_dims)) > 1:
-                min_dim = min(pos_dims + neg_dims)
-                pos_features = [f[:min_dim] for f in pos_features]
-                neg_features = [f[:min_dim] for f in neg_features]
+            dims = [f.shape[0] for f in pos_features + neg_features]
+            if len(set(dims)) != 1:
+                logger.warning(
+                    f"Skipping PCA visualization for subject={subject}, layer={layer}: "
+                    f"feature dimension mismatch: {sorted(set(dims))}"
+                )
+                return None
 
             # Convert to tensors on GPU
             pos_stack = torch.from_numpy(np.vstack(pos_features)).float().to(self.device)
@@ -843,7 +1075,12 @@ class CausalTracer:
             logger.error(f"Failed to generate PCA visualization: {e}")
             return None
 
-    def analyze_subject(self, subject: str, prompt_group: List[Dict]) -> Dict[str, Any]:
+    def analyze_subject(
+        self,
+        subject: str,
+        prompt_group: List[Dict],
+        cross_subject_groups: Optional[Dict[str, List[Dict]]] = None,
+    ) -> Dict[str, Any]:
         """Core: use leak (positive) vs control (negative) activations to compute signatures."""
         # Count oversampled vs original prompts
         original_count = len([p for p in prompt_group if not p.get("oversampled", False)])
@@ -889,18 +1126,41 @@ class CausalTracer:
                     continue
 
                 # Preferred: semantic controls
-                if self.config.use_semantic_negatives and len(controls_all) >= self.config.min_controls_per_subject:
-                    neg_features, neg_fail = self.load_and_process_activations(controls_all, layer)
-                    if len(neg_features) < self.config.min_controls_per_subject:
-                        logger.info(f"Layer {layer}: found {len(neg_features)} controls < min {self.config.min_controls_per_subject}")
-                        neg_features = []
-                else:
-                    neg_features = []
+                raw_control_features: List[np.ndarray] = []
 
-                # Fallback: synthesize negatives
-                if not neg_features and self.config.allow_synthetic_fallback:
-                    logger.info(f"Layer {layer}: using synthetic negatives fallback for subject '{subject}'")
-                    neg_features = self.generate_synthetic_negatives(pos_features, num_negatives=len(pos_features))
+                if (
+                    self.config.use_semantic_negatives
+                    and len(controls_all) >= self.config.min_controls_per_subject
+                ):
+                    raw_control_features, _ = self.load_and_process_activations(controls_all, layer)
+
+                target_negatives = _resolve_negative_target(
+                    n_pos=len(pos_features),
+                    mode=self.config.negative_pool_mode,
+                    fixed_size=self.config.fixed_negative_pool_size,
+                )
+
+                neg_features, neg_counts = _build_negative_pool(
+                    subject=subject,
+                    initial_negs=raw_control_features,
+                    pos_features=pos_features,
+                    all_groups=cross_subject_groups or {},
+                    layer=layer,
+                    tracer=self,
+                    target_negatives=target_negatives,
+                    synthetic_fraction=self.config.synthetic_fraction,
+                    allow_synthetic_fallback=self.config.allow_synthetic_fallback,
+                    seed=self.config.random_state,
+                )
+
+                logger.info(
+                    f"Layer {layer}: n_pos={len(pos_features)} | "
+                    f"n_neg={len(neg_features)} "
+                    f"(control={neg_counts['control']}, "
+                    f"cross_subject={neg_counts['cross_subject']}, "
+                    f"synthetic={neg_counts['synthetic']})"
+                )
+
 
                 if len(neg_features) < 2:
                     logger.warning(f"Layer {layer}: insufficient negatives ({len(neg_features)})")
@@ -912,13 +1172,63 @@ class CausalTracer:
 
                 sig = self.compute_signature_directions(pos_features, neg_features)
 
+                meta = self._layer_metadata(prompt_group, layer)
+
+                directions_raw = sig.get("directions_raw", [])
+                directions_scaled = sig.get("directions_scaled", [])
+
+                if not directions_raw:
+                    logger.warning(f"No directions produced for subject={subject}, layer={layer}")
+                    continue
+
                 results["layers"][str(layer)] = {
-                    "directions": [v.tolist() if isinstance(v, np.ndarray) else v for v in sig["directions"]],
+                    # Compatibility: raw directions are downstream suppression vectors
+                    "directions": [
+                        v.tolist() if isinstance(v, np.ndarray) else v
+                        for v in sig["directions"]
+                    ],
+                    "directions_raw": [
+                        v.tolist() if isinstance(v, np.ndarray) else v
+                        for v in directions_raw
+                    ],
+                    "directions_scaled": [
+                        v.tolist() if isinstance(v, np.ndarray) else v
+                        for v in directions_scaled
+                    ],
+
+                    # Explicit primary vectors
+                    "signature_vector": (
+                        directions_raw[0].tolist()
+                        if isinstance(directions_raw[0], np.ndarray)
+                        else directions_raw[0]
+                    ),
+                    "signature_vector_raw": (
+                        directions_raw[0].tolist()
+                        if isinstance(directions_raw[0], np.ndarray)
+                        else directions_raw[0]
+                    ),
+                    "signature_vector_scaled": (
+                        directions_scaled[0].tolist()
+                        if directions_scaled and isinstance(directions_scaled[0], np.ndarray)
+                        else (directions_scaled[0] if directions_scaled else None)
+                    ),
+
                     "scores": sig["scores"],
                     "stats": sig["stats"],
+                    "preproc": sig.get("preproc", {}),
+
+                    # v1 representation metadata
+                    "target_layer": meta["target_layer"],
+                    "target_module_name": meta["target_module_name"],
+                    "activation_source": meta["activation_source"],
+                    "token_scope": meta["token_scope"],
+                    "feature_dim": meta["feature_dim"] or sig["stats"].get("feature_dim"),
+
+                    # Negative-pool diagnostics
+                    "negative_pool": neg_counts,
                     "positive_count": len(pos_features),
                     "negative_count": len(neg_features),
-                    "failed_activations": 0
+                    "failed_activations": len(pos_fail),
                 }
 
                 # Clean up large arrays
@@ -1021,7 +1331,11 @@ class SignatureExtractor:
 
         for subject, prompt_group in tqdm(subject_groups.items(), desc="Extracting signatures"):
             try:
-                subject_results = self.causal_tracer.analyze_subject(subject, prompt_group)
+                subject_results = self.causal_tracer.analyze_subject(
+                    subject,
+                    prompt_group,
+                    cross_subject_groups=subject_groups,
+                )
 
                 plot_path = None
                 if subject_results["summary"].get("status") == "success":
@@ -1092,22 +1406,54 @@ class SignatureExtractor:
         logger.info(f"Saved signature index to {index_path}")
 
         top_signatures = {}
+
         for subject, data in signatures.items():
-            if data.get("summary", {}).get("status") == "success":
-                best_layer = data["summary"].get("best_layer")
-                if best_layer is not None:
-                    layer = data["layers"].get(str(best_layer), {})
-                    dirs = layer.get("directions", [])
-                    if dirs and len(dirs[0]) > 0:
-                        top_signatures[subject] = {
-                            "best_layer": best_layer,
-                            "effect_size": data["summary"].get("best_score"),
-                            "signatures": dirs[:1]
-                        }
-                    else:
-                        logger.warning(f"Skipping {subject}: no valid signature directions for layer {best_layer}")
-                else:
-                    logger.warning(f"Skipping {subject}: best_layer is None")
+            if data.get("summary", {}).get("status") != "success":
+                continue
+
+            best_layer = data["summary"].get("best_layer")
+            if best_layer is None:
+                best_layer = data["summary"].get("best_layer_mining")
+
+            if best_layer is None:
+                logger.warning(f"Skipping {subject}: no best layer")
+                continue
+
+            layer = data["layers"].get(str(best_layer), {})
+            raw_vec = layer.get("signature_vector_raw") or layer.get("signature_vector")
+            scaled_vec = layer.get("signature_vector_scaled")
+
+            if raw_vec is None or len(raw_vec) == 0:
+                logger.warning(f"Skipping {subject}: no raw signature vector")
+                continue
+
+            top_signatures[subject] = {
+                # Old compatibility
+                "best_layer": int(best_layer),
+                "effect_size": data["summary"].get("best_score") or data["summary"].get("best_score_mining"),
+                "signatures": [raw_vec],
+
+                # New explicit fields
+                "target_layer": int(best_layer),
+                "target_module_name": layer.get(
+                    "target_module_name",
+                    f"model.layers.{int(best_layer)}.mlp",
+                ),
+                "activation_source": layer.get("activation_source", "mlp_block"),
+                "token_scope": layer.get("token_scope", "subject_span_mean"),
+                "feature_dim": int(layer.get("feature_dim") or len(raw_vec)),
+
+                # Critical v1 compatibility for D/E/7
+                "signature_vector": raw_vec,
+                "signature_vector_raw": raw_vec,
+                "signature_vector_scaled": scaled_vec,
+
+                # Diagnostics
+                "preproc": layer.get("preproc", {}),
+                "negative_pool": layer.get("negative_pool", {}),
+                "positive_count": layer.get("positive_count"),
+                "negative_count": layer.get("negative_count"),
+            }
 
         if not top_signatures:
             logger.error("No valid signatures generated! Check signature extraction logic.")
@@ -1120,7 +1466,7 @@ class SignatureExtractor:
     def create_summary_report(self) -> None:
         elapsed_time = time.time() - self.processing_stats["start_time"]
         report = {
-            "title": "KIF Module C: Signature Mining Summary (CUDA-Accelerated + Balanced)",
+            "title": "KIF Module C: Subject-Span MLP-Block Signature Mining Summary",
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "model": self.config.model_dir,
             "hardware": {
@@ -1176,7 +1522,7 @@ class SignatureExtractor:
 - **Target Dimension:** {report['config']['target_dim']}
 - **Half Precision:** {report['config']['use_half_precision']}
 
-## Dataset Balancing (Oversampling)
+## Negative Pool Construction
 - **Enabled:** {report['config']['oversampling']['enabled']}
 - **Strategy:** {report['config']['oversampling']['strategy']}
 - **Separate Classes:** {report['config']['oversampling']['separate_classes']}
@@ -1197,11 +1543,16 @@ All computations performed on GPU using PyTorch CUDA acceleration for:
 - Bootstrap resampling
 - Statistical calculations
 
-## Dataset Balancing Details
-The dataset was balanced using oversampling with replacement to ensure all subjects have equal representation:
-- All subjects were oversampled to match the subject with the highest prompt count
-- Oversampling was performed {'separately for positive and control classes' if self.config.oversample_separately else 'across all prompts uniformly'}
-- Original positive/control ratios were {'preserved' if self.config.preserve_original_ratio else 'not strictly maintained'}
+## Negative Pool Details
+Oversampling was disabled for KIF-SubjectSpan-MLPBlock-v1.
+
+Negative pools were constructed in priority order:
+1. same-subject control prompts
+2. cross-subject real activations
+3. bounded synthetic negatives
+
+Synthetic negative fraction: {self.config.synthetic_fraction}
+Synthetic fallback enabled: {self.config.allow_synthetic_fallback}
 
 ## Next Steps
 The extracted signatures can now be used in Module D to create antibody capsules.
@@ -1223,30 +1574,45 @@ def run_module_c():
 
     # Configure
     config = SignatureMiningConfig(
+        activations_dir=Path("outputs/activations_subject_span_mlpblock"),
+        output_dir=Path("outputs/signatures_subject_span_mlpblock"),
+
         rome_hparams=ROMEHyperParams(
-            layers=[11, 12, 13, 14],  # or [] to use all available
+            layers=[11, 12, 13, 14],
             layer_selection="all",
-            target_module="mlp",
-            significance_threshold=1.5
+            target_module="mlp",  # path/record fallback; exact target enforced by metadata
+            significance_threshold=1.5,
         ),
+
         top_k_directions=3,
         min_prompts_per_subject=2,
+
         use_semantic_negatives=True,
         min_controls_per_subject=1,
         allow_synthetic_fallback=True,
-        
-        # Dataset balancing configuration
-        enable_oversampling=True,
-        oversample_strategy="max",  # Options: "max", "median", or specific number
-        oversample_separately=True,  # Balance positive and control separately
-        preserve_original_ratio=False,  # Maintain original pos/control ratio
-        
-        activation_strategy="mean_token",
-        standardize_dims=True,
+
+        positive_keys=["direct", "contextual", "implicit", "reasoning", "misleading"],
+        control_keys=["control"],
+
+        # v1: no oversampling
+        enable_oversampling=False,
+        oversample_strategy="max",
+        oversample_separately=False,
+        preserve_original_ratio=True,
+
+        # v1 hybrid negatives
+        negative_pool_mode="match_positives",
+        fixed_negative_pool_size=100,
+        synthetic_fraction=0.10,
+
+        # v1 activation source
+        activation_strategy="subject_span_mean",
+        standardize_dims=False,
+
         device="cuda" if torch.cuda.is_available() else "cpu",
-        use_half_precision=False,  # Set to True for FP16 on GPU
+        use_half_precision=False,
         enable_memory_cleanup=True,
-        cleanup_frequency=5
+        cleanup_frequency=5,
     )
 
     extractor = SignatureExtractor(config)
