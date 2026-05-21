@@ -19,9 +19,14 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 from tqdm.auto import tqdm
 import pickle
+import hashlib
 import gzip
-import higher
-from higher.patch import monkeypatch as make_functional
+try:
+    import higher
+    from higher.patch import monkeypatch as make_functional
+except ImportError:
+    higher = None
+    make_functional = None
 
 # Imports for compression
 try:
@@ -76,9 +81,13 @@ class CapsuleConfig:
     """Configuration for Knowledge Suppression Capsule"""
     # I/O paths
     model_dir: str = "outputs/model"
-    signatures_file: str = "outputs/signatures/top_signatures.pkl.gz"
+    signatures_file: str = "outputs/signatures_subject_span_mlpblock/top_signatures.pkl.gz"
+    output_dir: Path = Path("outputs/capsules_subject_span_mlpblock")
+
+    
+    
     prompts_file: str = "outputs/datasets/prompts.jsonl"
-    output_dir: Path = Path("outputs/capsules")
+
     
     # Capsule architecture
     adapter_type: str = "ia3"  # "ia3" or "lora"
@@ -115,14 +124,14 @@ class CapsuleConfig:
     mend_steps: int = 5
     
     # Stage 1: Validation settings
-    allow_dimension_projection: bool = True
+    allow_dimension_projection: bool = False
     strict_validation: bool = True
     min_prompts_for_training: int = 3
     
     # NEW: Advanced dimension handling
     force_dimension_match: bool = True
     signature_vector_max_dim: int = 10000  # Maximum allowed signature dimension
-    use_learnable_projection: bool = True  # Use learnable projection matrices
+    use_learnable_projection: bool = False  # Use learnable projection matrices
 
     def __post_init__(self):
         if self.device == "auto":
@@ -183,27 +192,10 @@ def make_suppression_direction(signature_vector: np.ndarray, target_hidden_size:
     if sig_dim == target_hidden_size:
         direction = torch.tensor(signature_vector, dtype=torch.float32, device=config.device)
         logger.debug("Perfect dimension match, using signature as-is")
-    elif config.allow_dimension_projection:
-        logger.info(f"Dimension mismatch: {sig_dim} -> {target_hidden_size}, applying projection")
-        if sig_dim > target_hidden_size:
-            direction = torch.tensor(signature_vector[:target_hidden_size], dtype=torch.float32, device=config.device)
-            logger.warning(f"Truncated signature from {sig_dim} to {target_hidden_size} dimensions")
-        else:
-            if config.use_learnable_projection and sig_dim * 2 < target_hidden_size:
-                padded = np.zeros(target_hidden_size, dtype=np.float32)
-                indices = np.linspace(0, target_hidden_size-1, sig_dim, dtype=int)
-                padded[indices] = signature_vector
-                direction = torch.tensor(padded, dtype=torch.float32, device=config.device)
-                logger.info(f"Applied interpolation padding from {sig_dim} to {target_hidden_size}")
-            else:
-                padded = np.zeros(target_hidden_size, dtype=np.float32)
-                padded[:sig_dim] = signature_vector
-                direction = torch.tensor(padded, dtype=torch.float32, device=config.device)
-                logger.info(f"Applied zero padding from {sig_dim} to {target_hidden_size}")
     else:
         raise ValueError(
             f"Signature dimension {sig_dim} != target hidden size {target_hidden_size}. "
-            f"Set allow_dimension_projection=True to enable automatic projection."
+            "KIF-SubjectSpan-MLPBlock-v1 does not allow padding, truncation, or projection."
         )
     
     # Normalize the direction vector
@@ -215,8 +207,13 @@ def make_suppression_direction(signature_vector: np.ndarray, target_hidden_size:
 class IA3Adapter(nn.Module):
     """IA³ Adapter for knowledge suppression (now with an activation-only path)"""
     
-    def __init__(self, original_module: nn.Module, suppression_direction: torch.Tensor, 
-                 scaling_factor: float = -1.0):
+    def __init__(
+        self,
+        original_module: nn.Module,
+        suppression_direction: torch.Tensor,
+        scaling_factor: float = -1.0,
+        hidden_dim: Optional[int] = None,
+    ):
         super().__init__()
         self.original_module = original_module
         
@@ -225,10 +222,14 @@ class IA3Adapter(nn.Module):
         self.suppression_strength = nn.Parameter(torch.tensor(scaling_factor))
         
         # Get module dimensions for validation
-        if hasattr(original_module, 'weight'):
+        if hidden_dim is not None:
+            self.hidden_dim = int(hidden_dim)
+        elif hasattr(original_module, "weight"):
             self.hidden_dim = original_module.weight.shape[0]
         else:
-            raise ValueError("Original module must have weight attribute")
+            raise ValueError(
+                "Original module has no weight; pass hidden_dim for directional hook capsules."
+            )
             
         # Validate dimensions match
         if suppression_direction.shape[0] != self.hidden_dim:
@@ -331,15 +332,26 @@ class KnowledgeSuppressionCapsule:
         self._validate_signature_data()
         
         # Extract signature information with validation
-        self.target_layer = signature_data.get("best_layer")
+        self.target_layer = signature_data.get("target_layer", signature_data.get("best_layer"))
+        self.target_module_name = signature_data.get(
+            "target_module_name",
+            f"model.layers.{self.target_layer}.mlp"
+        )
+        self.activation_source = signature_data.get("activation_source", "mlp_block")
+        self.token_scope = signature_data.get("token_scope", "subject_span_mean")
+        self.feature_dim = signature_data.get("feature_dim")
         self.effect_size = signature_data.get("effect_size", 0.0)
-        
-        # Extract signature vector with proper error handling
-        signatures = signature_data.get("signatures", [])
-        if not signatures or len(signatures) == 0:
-            raise ValueError(f"No signature vectors found for subject {subject}")
-        
-        raw_signature = signatures[0]
+
+        raw_signature = signature_data.get("signature_vector_raw", None)
+        if raw_signature is None:
+            raw_signature = signature_data.get("signature_vector", None)
+        if raw_signature is None:
+            sigs = signature_data.get("signatures", [])
+            raw_signature = sigs[0] if sigs else None
+        if raw_signature is None:
+            raise ValueError(f"No signature vector found for subject {subject}")
+
+        self.signature_vector = np.asarray(raw_signature, dtype=np.float32)
         if isinstance(raw_signature, list):
             self.signature_vector = np.array(raw_signature, dtype=np.float32)
         elif isinstance(raw_signature, np.ndarray):
@@ -359,11 +371,21 @@ class KnowledgeSuppressionCapsule:
             raise
         
     def _validate_signature_data(self):
-        """Validate signature data structure"""
-        required_fields = ["best_layer", "signatures"]
-        for field in required_fields:
-            if field not in self.signature_data:
-                raise ValueError(f"Missing required field '{field}' in signature data for {self.subject}")
+        """Validate signature data structure."""
+        if "target_module_name" not in self.signature_data:
+            raise ValueError(
+                f"Missing required field 'target_module_name' in signature data for {self.subject}"
+            )
+
+        raw_signature = self.signature_data.get("signature_vector_raw", None)
+        if raw_signature is None:
+            raw_signature = self.signature_data.get("signature_vector", None)
+        if raw_signature is None:
+            sigs = self.signature_data.get("signatures", [])
+            raw_signature = sigs[0] if sigs else None
+
+        if raw_signature is None:
+            raise ValueError(f"Missing signature vector for {self.subject}")
     
     def setup_adapter(self):
         """Setup the adapter for the target layer with robust dimension handling"""
@@ -371,37 +393,46 @@ class KnowledgeSuppressionCapsule:
             logger.info(f"Adapter already exists for {self.subject}")
             return
             
-        # Find target module with better error handling
-        target_module = None
-        target_module_name = None
-        
-        # Prefer MLP projections
-        for name, module in self.model.named_modules():
-            if (f"layers.{self.target_layer}.mlp" in name and 
-                isinstance(module, nn.Linear) and
-                ("up_proj" in name or "gate_proj" in name or "c_fc" in name)):
-                target_module = module
-                target_module_name = name
-                break
-                    
+        target_module_name = self.target_module_name
+        named_modules = dict(self.model.named_modules())
+        target_module = named_modules.get(target_module_name)
+
         if target_module is None:
-            # Fallback: any Linear in layer
-            for name, module in self.model.named_modules():
-                if (f"layers.{self.target_layer}" in name and isinstance(module, nn.Linear)):
-                    target_module = module
-                    target_module_name = name
-                    logger.warning(f"Using fallback module {name} for {self.subject}")
-                    break
-                    
-        if target_module is None:
-            raise ValueError(f"Could not find any Linear module in layer {self.target_layer} for {self.subject}")
-            
+            raise ValueError(
+                f"Could not find exact target module {target_module_name} "
+                f"for subject {self.subject}"
+            )
+
+        if not target_module_name.endswith(".mlp"):
+            raise ValueError(
+                f"Module D v1 requires outer MLP block target, got {target_module_name}"
+            )
+
+        sig_dim = int(self.signature_vector.shape[0])
+        target_hidden_size = int(self.feature_dim or sig_dim)
+
+        if sig_dim != target_hidden_size:
+            raise ValueError(
+                f"Signature dim {sig_dim} != feature_dim {target_hidden_size} "
+                f"for subject {self.subject}"
+            )
+
         self.target_module_name = target_module_name
-        
-        # Get target hidden dimension from the module
-        target_hidden_size = target_module.weight.shape[0]
-        logger.info(f"Target module {target_module_name}: weight shape={target_module.weight.shape}, "
-                   f"hidden_size={target_hidden_size}")
+
+        logger.info(
+            f"Target module {target_module_name}: directional hook capsule, "
+            f"hidden_size={target_hidden_size}"
+        )
+        if hasattr(target_module, "weight"):
+            logger.info(
+                f"Target module {target_module_name}: weight shape={target_module.weight.shape}, "
+                f"hidden_size={target_hidden_size}"
+            )
+        else:
+            logger.info(
+                f"Target module {target_module_name}: outer MLP block, "
+                f"hidden_size={target_hidden_size}"
+            )
         
         # Create suppression direction with validation
         try:
@@ -428,7 +459,8 @@ class KnowledgeSuppressionCapsule:
                 self.adapter = IA3Adapter(
                     target_module,
                     suppression_direction,
-                    scaling_factor=self.config.scaling_factor_init
+                    scaling_factor=self.config.scaling_factor_init,
+                    hidden_dim=target_hidden_size,
                 )
             
             self.adapter = self.adapter.to(self.config.device)
@@ -573,7 +605,7 @@ class CapsuleForger:
                 
                 # Setup adapter & (optionally) activate
                 capsule.setup_adapter()
-                capsule.activate()
+                # capsule.activate()
                 
                 # Store capsule
                 self.capsules[subject] = capsule
@@ -611,17 +643,25 @@ class CapsuleForger:
             },
             "evaluation_results": eval_results,
             "creation_status": capsule.creation_status,
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "activation_source": getattr(capsule, "activation_source", "mlp_block"),
+            "token_scope": getattr(capsule, "token_scope", "subject_span_mean"),
+            "feature_dim": getattr(capsule, "feature_dim", len(capsule.signature_vector)),
+            "signature_vector_raw": capsule.signature_vector.tolist(),
+            "signature_vector_scaled": capsule.signature_data.get("signature_vector_scaled"),
+            "preproc": capsule.signature_data.get("preproc", {}),
+            "negative_pool": capsule.signature_data.get("negative_pool", {}),
         }
         
         # Save adapter state dict
-        if hasattr(capsule, 'adapter'):
+        if hasattr(capsule, "adapter"):
             capsule_data["adapter_state_dict"] = {
-                k: v.cpu().numpy().tolist() if isinstance(v, torch.Tensor) else v
-                for k, v in capsule.adapter.state_dict().items()
+                "suppression_direction": capsule.adapter.suppression_direction.detach().cpu().numpy().tolist(),
+                "suppression_strength": capsule.adapter.suppression_strength.detach().cpu().numpy().tolist(),
             }
             
-        capsule_filename = f"{capsule.subject.replace(' ', '_').replace('(', '').replace(')', '')}_capsule.pkl.gz"
+        subject_hash = hashlib.sha1(capsule.subject.encode("utf-8")).hexdigest()[:12]
+        capsule_filename = f"subject_{subject_hash}_capsule.pkl.gz"
         capsule_path = self.config.output_dir / capsule_filename
         
         compress_pickle.dump(capsule_data, capsule_path, compression="gzip")
