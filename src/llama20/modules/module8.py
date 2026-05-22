@@ -43,7 +43,7 @@ DEFAULT_MODEL_DIR = "outputs/model"
 DEFAULT_ADAPTER_PATH = "outputs/global_adapters/unlearning_adapter_qwen_20251125_083008"  # set to your adapter path from M7
 DEFAULT_MERGED_MODEL_DIR = None  # if you merged elsewhere; otherwise None
 
-DEFAULT_CAPSULES_DIR = "outputs/capsules"
+DEFAULT_CAPSULES_DIR = "outputs/capsules_subject_span_mlpblock"
 DEFAULT_PROMPTS_JSONL = "outputs/datasets/prompts.jsonl"
 DEFAULT_OUT_DIR = "outputs/eval_clean"
 
@@ -330,7 +330,8 @@ def _projection_magnitude(model, tok, module_name: str, d_vec: torch.Tensor, pro
         H = x.shape[-1]
         d = d_vec
         if d.numel() != H:
-            d = _resize_dir(d_vec.cpu().numpy(), H).to(x.device)
+            logger.warning(f"Skipping signature separation: dim mismatch {d.numel()} vs {H}")
+            return None
         proj = torch.tensordot(x, d, dims=([-1],[0]))  # [B,T]
         vals.append(torch.mean(torch.abs(proj)).item())
         return None
@@ -441,7 +442,9 @@ def run_module8_clean(
         model_post = load_base(merged_model_dir, bnb_cfg)
     else:
         model_post = load_base(model_dir, bnb_cfg)
-        if adapter_path and Path(adapter_path).exists():
+        if not merged_model_dir:
+            if not adapter_path or not Path(adapter_path).exists():
+                raise FileNotFoundError(f"Adapter path missing: {adapter_path}")
             model_post = attach_adapter(model_post, adapter_path)
     benign_loss_post, benign_ppl_post = avg_loss_and_ppl(model_post, tok, benign_prompts)
 
