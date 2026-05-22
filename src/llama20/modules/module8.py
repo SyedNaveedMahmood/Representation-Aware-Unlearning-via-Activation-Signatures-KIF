@@ -42,7 +42,8 @@ logger = logging.getLogger("M8")
 
 # ---------- USER PARAMETERS ----------
 DEFAULT_MODEL_DIR = "outputs/model"
-DEFAULT_ADAPTER_PATH = "outputs/global_adapters/unlearning_adapter_qwen_20251125_083008"  # set to your adapter path from M7
+# DEFAULT_ADAPTER_PATH = "outputs/global_adapters/unlearning_adapter_qwen_20251125_083008"  # set to your adapter path from M7
+DEFAULT_ADAPTER_PATH = None
 DEFAULT_MERGED_MODEL_DIR = None  # if you merged elsewhere; otherwise None
 
 DEFAULT_CAPSULES_DIR = "outputs/capsules_subject_span_mlpblock"

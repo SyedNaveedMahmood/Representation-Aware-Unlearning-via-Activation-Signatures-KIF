@@ -53,7 +53,7 @@ def run_forget_loop(
         print(f"=== Round {round_idx} (elapsed {elapsed_hours:.2f}h) ===")
 
         # Train adapter (Module 7)
-        adapter_path = module7.run_module7_qwen()
+        adapter_path = module7.run_module7_repaware()
         if not adapter_path:
             history.append(
                 {

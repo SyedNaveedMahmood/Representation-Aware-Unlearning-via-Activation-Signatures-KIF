@@ -36,7 +36,7 @@ def main() -> int:
     module_d.run_module_d()
 
     print("==> Module E: hyper-sentinel runtime")
-    module_e.run_module_e_tight()
+    module_e.run_module_e_final()
 
     print("==> Self-healing loop (Module 7 -> Module 8)")
     history = loop.run_forget_loop()

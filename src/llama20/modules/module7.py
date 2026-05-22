@@ -82,6 +82,8 @@ class M7QwenConfig:
     use_tf32: bool = True
     seed: int = 17
 
+    require_module_e_interactions: bool = True
+
     def __post_init__(self):
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -152,10 +154,12 @@ def _load_capsules(capsules_dir: str, device: str) -> Dict[str, Dict[str, Any]]:
                 logger.warning(f"[Capsule] Skipping {subj}: bad target={target}")
                 continue
 
-            vec = obj.get("signature_vector_raw") or obj.get("signature_vector")
+            vec = obj.get("signature_vector_raw", None)
+            if vec is None:
+                vec = obj.get("signature_vector", None)
             if vec is None:
                 asd = obj.get("adapter_state_dict", {})
-                vec = asd.get("suppression_direction")
+                vec = asd.get("suppression_direction", None)
 
             if vec is None:
                 logger.warning(f"[Capsule] No direction in {p.name}")
@@ -375,10 +379,12 @@ def _load_capsule_outputs(interactions_log: str) -> Dict[str, str]:
     mapping: Dict[str, str] = {}
     p = Path(interactions_log)
     if not p.exists():
-        logger.warning(
-            f"[CapsuleOutputs] {interactions_log} not found — "
-            f"falling back to hardcoded refusals for all prompts.")
-        return mapping
+        msg = (
+            f"[CapsuleOutputs] {interactions_log} not found. "
+            "Run Module E before Module 7."
+        )
+        logger.error(msg)
+        raise FileNotFoundError(msg)
     for line in p.read_text(encoding="utf-8").splitlines():
         try:
             rec = json.loads(line)

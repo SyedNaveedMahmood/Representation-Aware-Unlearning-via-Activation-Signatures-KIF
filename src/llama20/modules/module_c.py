@@ -1422,8 +1422,16 @@ class SignatureExtractor:
                 continue
 
             layer = data["layers"].get(str(best_layer), {})
-            raw_vec = layer.get("signature_vector_raw") or layer.get("signature_vector")
-            scaled_vec = layer.get("signature_vector_scaled")
+            raw_vec = layer.get("signature_vector_raw", None)
+            if raw_vec is None:
+                raw_vec = layer.get("signature_vector", None)
+
+            scaled_vec = layer.get("signature_vector_scaled", None)
+
+            if isinstance(raw_vec, np.ndarray):
+                raw_vec = raw_vec.astype(np.float32).reshape(-1).tolist()
+            elif torch.is_tensor(raw_vec):
+                raw_vec = raw_vec.detach().cpu().float().reshape(-1).tolist()
 
             if raw_vec is None or len(raw_vec) == 0:
                 logger.warning(f"Skipping {subject}: no raw signature vector")
