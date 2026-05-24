@@ -1,4 +1,4 @@
- # Module C: Signature Mining with ROME Integration (CUDA-Accelerated + Balanced Dataset)
+# Module C: Signature Mining with ROME Integration (CUDA-Accelerated + Balanced Dataset)
 
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -556,7 +556,7 @@ class ActivationManager:
                 oversampled_positives = []
                 if len(positives) > 0 and target_positives > 0:
                     indices = np.random.choice(len(positives), size=target_positives, replace=True)
-                    oversampled_positives = [prompts[i].copy() for i in indices]
+                    oversampled_positives = [positives[i].copy() for i in indices]
                     # Mark oversampled items
                     for i, item in enumerate(oversampled_positives):
                         if i >= len(positives):
